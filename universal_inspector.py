@@ -639,22 +639,35 @@ class Inspector:
                 or request.resource_type in {"xhr", "fetch", "document", "script"}
             )
 
-            if textual:
+            is_sse = "text/event-stream" in content_type.lower()
+            if textual or is_sse:
                 try:
-                    raw = await asyncio.wait_for(response.body(), timeout=5.0)
+                    timeout = 1.0 if is_sse else 5.0
+                    raw = await asyncio.wait_for(response.body(), timeout=timeout)
                     response_info["body_bytes"] = len(raw)
                     response_info["body_sha256"] = hashlib.sha256(raw).hexdigest()
                     if len(raw) > self.max_body_bytes:
                         raw = raw[:self.max_body_bytes]
                         response_info["body_truncated"] = True
                     text = raw.decode("utf-8", errors="replace")
-                    obj = try_parse_json(text)
-                    if obj is not None:
-                        obj = redact_json_like(obj, self.include_sensitive)
-                        response_info["body_json"] = obj
-                        response_info["body_text"] = json.dumps(obj, ensure_ascii=False)
-                    else:
+
+                    if is_sse:
                         response_info["body_text"] = text
+                        response_info["body_kind"] = "sse"
+                    else:
+                        obj = try_parse_json(text)
+                        if obj is not None:
+                            obj = redact_json_like(obj, self.include_sensitive)
+                            response_info["body_json"] = obj
+                            response_info["body_text"] = json.dumps(obj, ensure_ascii=False)
+                        else:
+                            response_info["body_text"] = text
+                except asyncio.TimeoutError:
+                    if is_sse:
+                        response_info["body_error"] = "SSE stream or long-polling connection (timed out waiting for full body)"
+                        response_info["body_kind"] = "sse"
+                    else:
+                        response_info["body_error"] = "Timeout reading body"
                 except Exception as e:
                     response_info["body_error"] = repr(e)
 
@@ -814,7 +827,10 @@ class Inspector:
 
           function xpath(el) {
             if (!el || el.nodeType !== 1) return "";
-            if (el.id) return `//*[@id="${el.id}"]`;
+            if (el.id) {
+              const safeId = el.id.replace(/"/g, '\"').replace(/'/g, "\\'");
+              return `//*[@id="${safeId}"]`;
+            }
             const parts = [];
             let cur = el;
             let depth = 0;
@@ -1311,7 +1327,13 @@ class Inspector:
             pending = [t for t in self._body_tasks if not t.done()]
             if pending:
                 print(f"[Inspector] Esperando {len(pending)} responses pendientes...")
-                await asyncio.gather(*pending, return_exceptions=True)
+                done, not_done = await asyncio.wait(pending, timeout=2.0)
+                if not_done:
+                    print(f"[Inspector] Cancelando {len(not_done)} responses que superaron el tiempo de espera...")
+                    for t in not_done:
+                        t.cancel()
+                    # Wait for cancellation to complete
+                    await asyncio.gather(*not_done, return_exceptions=True)
 
             print("[Inspector] Capturando estado final del DOM...")
             final_metric = await self.page_metric()
